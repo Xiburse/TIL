@@ -1,0 +1,35 @@
+/*
+ * 配色方案：default
+ *
+ * public/colors/ 下一个方案一个文件，结构固定 —— 复制这份改个名就是新方案。
+ *
+ * ⚠ 必须自带 :root 选择器：这个文件是被 @import 当独立样式表加载的，
+ *   裸写 --xxx: ... 没有选择器，解析器会把它当无效规则整段丢掉，
+ *   一个变量都进不来。
+ *
+ * color-scheme 告诉浏览器「这是浅色界面」，原生控件（输入框、滚动条、滚动箭头）
+ * 跟着走浅色，免得系统是深色模式时输入框比页面深一截。写深色方案时改成 dark。
+ */
+:root {
+  color-scheme: light;
+
+  /* —— 语义色 —— */
+  --color-primary: #699FBE;
+  --color-secondary: #8991BD;
+  --color-accent: #BB896C;
+  --color-background: #F7F7F8;
+  --color-surface: #E9EBEC;
+  --color-text: #1E2529;
+
+  /* —— primary 的梯度：50 最浅 … 900 最深。给强调色、悬停态、边框分层用 —— */
+  --color-primary-50: #F5F8F9;
+  --color-primary-100: #DBE6EB;
+  --color-primary-200: #C0D4DF;
+  --color-primary-300: #A4C2D3;
+  --color-primary-400: #87B0C8;
+  --color-primary-500: #699FBE;
+  --color-primary-600: #4582A5;
+  --color-primary-700: #32607B;
+  --color-primary-800: #203F50;
+  --color-primary-900: #0E1D25;
+}

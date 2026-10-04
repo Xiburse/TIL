@@ -1,0 +1,3 @@
+/* 24 = RT_MANIFEST。把清单作为资源嵌进可执行文件。
+   由 build.rs 的 embed_resource::compile_for_everything 编译并链接到所有目标。 */
+1 24 "windows-app.manifest"

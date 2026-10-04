@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  只给**测试目标**用的应用清单，由 build.rs 通过 /MANIFESTINPUT: 传进去。
+
+  主二进制的清单由 tauri-build 自己嵌，不要动这一份去影响它。
+
+  为什么需要它：声明 Common Controls v6 依赖。缺了这个，加载器解析不了
+  comctl32 的 SxS 依赖，测试进程会在跑任何一条用例之前就以
+  STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) 挂掉 —— 报错看着像链接问题，
+  其实是清单问题，很难查。
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+</assembly>

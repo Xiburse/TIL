@@ -1,0 +1,248 @@
+//! 9 条后端命令的 Tauri 封装，外加取消。
+//!
+//! # 为什么是 9 个命令而不是一个 `backend_invoke(cmd, args)`
+//!
+//! 1. 前端的可发现性 —— `invoke('backend_search', ...)` 比传字符串命令名清楚。
+//! 2. **必填参数校验需要按命令做。** Python 侧对必填参数零校验，不传就静默
+//!    返回空结果（详见下面 `require` 的注释）。
+//!
+//! # 返回值形状
+//!
+//! 全部返回 `Result<BackendOutcome, BackendError>`：
+//!
+//! - **后端跑完了**（哪怕信封里 `ok: false`）→ `Ok(BackendOutcome)`。
+//!   `config_error` 之类是一次**成功的 IPC 往返**，不该变成 JS 异常。
+//! - **传输层失败**（起不了进程 / 没吐 result / 被取消 / 忙）→ `Err(BackendError)`，
+//!   序列化成一个扁平对象给前端 `catch`。
+//!
+//! # 参数名是 camelCase
+//!
+//! Tauri 默认把 command 的**顶层参数名**转成 camelCase，但 `BackendArgs`
+//! **内部字段保持 snake_case**（serde 自己处理，正好匹配 Python 的键名）。
+//! 所以前端要写 `invoke('backend_search', { args: { tags_all: [...] } })`。
+
+use tauri::{AppHandle, Manager, State};
+
+use super::{BackendArgs, BackendError, BackendOutcome, BackendState};
+
+/// 把活儿丢进 blocking 线程池再 await。
+///
+/// `#[tauri::command]` 的 fn 体是跑在 tokio worker 上的，而这里可能一阻塞就是
+/// 几十分钟（`ingest` 一万张图）。直接阻塞会把 worker 占死 —— 并发几条命令
+/// 再叠加一个 `cancel`，就会互相饿死。`spawn_blocking` 把活儿挪出 worker。
+async fn dispatch(
+    app: AppHandle,
+    cmd: &'static str,
+    args: Option<BackendArgs>,
+    streaming: bool,
+) -> Result<BackendOutcome, BackendError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<BackendState>();
+        state.execute(Some(&app), cmd, args, streaming)
+    })
+    .await
+    .map_err(|e| BackendError::Spawn {
+        message: format!("后台任务异常终止：{e}"),
+    })?
+}
+
+/// 必填参数校验。
+///
+/// Python 侧**对必填参数零校验**，不传就静默返回空结果，前端会把「忘了传」
+/// 显示成「没有数据」：
+///
+/// - `image_detail` 不传 `image_id` → 返回 `{"image": null}`，**与「真的找不到」无法区分**
+/// - `collection_tags` 既不给 `name` 也不给 `coll_id` → 静默返回空列表
+/// - `delete` 两个 id 数组都不给 → 等于什么都没删，却看起来成功了
+///
+/// 这是 `BackendArgs` 用强类型的另一半价值 —— 不校验就白强类型了。
+fn require(
+    args: Option<BackendArgs>,
+    satisfied: impl FnOnce(&BackendArgs) -> bool,
+    requirement: &str,
+) -> Result<BackendArgs, BackendError> {
+    let args = args.unwrap_or_default();
+    if satisfied(&args) {
+        Ok(args)
+    } else {
+        Err(BackendError::Protocol {
+            message: format!("参数不完整：{requirement}"),
+            raw: String::new(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 非流式（可并发）
+// ---------------------------------------------------------------------------
+
+/// 库的整体状态。**前端启动时第一个调它**，用它决定显示「空库引导」还是「图库」。
+///
+/// 注意 `model_exists: false` 时前端应当隐藏/禁用「开始打标」。
+#[tauri::command]
+pub async fn backend_status(app: AppHandle) -> Result<BackendOutcome, BackendError> {
+    dispatch(app, "status", None, false).await
+}
+
+/// 按 tag / 分级 / 日期 / 合集查图。
+///
+/// `min_conf` 默认 0 —— **能查到当初没过阈值的 tag**。想要「只查确定的」传 0.35。
+/// `limit` 不传表示不限制。
+///
+/// ⚠ 每次调用都是一次 Python 冷启动（150–300ms），前端搜索框**必须 debounce**。
+#[tauri::command]
+pub async fn backend_search(
+    app: AppHandle,
+    args: Option<BackendArgs>,
+) -> Result<BackendOutcome, BackendError> {
+    dispatch(app, "search", args, false).await
+}
+
+/// 单张图的完整 tag 列表（含置信度）。找不到时 `data.image` 为 `null`（不是报错）。
+#[tauri::command]
+pub async fn backend_image_detail(
+    app: AppHandle,
+    args: Option<BackendArgs>,
+) -> Result<BackendOutcome, BackendError> {
+    let args = require(
+        args,
+        |a| a.image_id.is_some(),
+        "image_detail 需要 image_id（归档文件名的主干，不是数据库 id）",
+    )?;
+    dispatch(app, "image_detail", Some(args), false).await
+}
+
+/// 标签频次排行。
+#[tauri::command]
+pub async fn backend_top_tags(
+    app: AppHandle,
+    args: Option<BackendArgs>,
+) -> Result<BackendOutcome, BackendError> {
+    dispatch(app, "top_tags", args, false).await
+}
+
+/// 合集树。返回**树序**（父在前，同级按 `side`），前端直接按 `depth` 缩进即可 ——
+/// 返回顺序就是正确的显示顺序，不用自己排。
+#[tauri::command]
+pub async fn backend_collections(
+    app: AppHandle,
+    args: Option<BackendArgs>,
+) -> Result<BackendOutcome, BackendError> {
+    dispatch(app, "collections", args, false).await
+}
+
+/// 某个合集的 tag 频次表。
+///
+/// 同名合集可能有多个（每次投放算一个新合集），**全部返回**。
+/// `data.collections[].tags[].freq` 是后端算好的 `count / image_count`，
+/// 前端直接用，别自己反推。
+#[tauri::command]
+pub async fn backend_collection_tags(
+    app: AppHandle,
+    args: Option<BackendArgs>,
+) -> Result<BackendOutcome, BackendError> {
+    let args = require(
+        args,
+        |a| a.name.is_some() || a.coll_id.is_some(),
+        "collection_tags 需要 name 或 coll_id（合集文件夹名，不是数据库 id）",
+    )?;
+    dispatch(app, "collection_tags", Some(args), false).await
+}
+
+// ---------------------------------------------------------------------------
+// 流式（单飞，同一时刻只能跑一个）
+// ---------------------------------------------------------------------------
+
+/// 处理 `inbox/`。流式，会产生 `model_loading` / `collection_start` /
+/// `image_done` / `progress` / `run_done` 等事件。
+///
+/// **成败要看 `data.exit_code`（0 全成功 / 2 部分失败），不是进程退出码，
+/// 也不是只看信封 `ok`。** 进程退出码永远是 0。
+///
+/// ⚠ `inbox` 为空时 `data` 里**没有 `exit_code` 这个键**，前端要用可选链。
+#[tauri::command]
+pub async fn backend_ingest(
+    app: AppHandle,
+    args: Option<BackendArgs>,
+) -> Result<BackendOutcome, BackendError> {
+    dispatch(app, "ingest", args, true).await
+}
+
+/// 从 `library/` 重建索引（不需要模型）。流式。
+///
+/// ⚠ `reindex` 的成败在 **`data.ok`**（不是信封的 `ok`）—— 遇到 OneDrive
+/// 占位符而没执行时 `data.ok` 是 `false`，但信封 `ok` 仍是 `true`。
+/// 只判信封会把「什么都没做」显示成成功。
+///
+/// `prune: true` 时**必须同时传 `yes: true`** 才真删，否则只报「将删除 N 行」。
+#[tauri::command]
+pub async fn backend_reindex(
+    app: AppHandle,
+    args: Option<BackendArgs>,
+) -> Result<BackendOutcome, BackendError> {
+    dispatch(app, "reindex", args, true).await
+}
+
+/// 巡检 `library/` 结构完整性。流式，坏的会发 `warning` 事件。
+#[tauri::command]
+pub async fn backend_verify(
+    app: AppHandle,
+    args: Option<BackendArgs>,
+) -> Result<BackendOutcome, BackendError> {
+    dispatch(app, "verify", args, true).await
+}
+
+/// 自检：GPU 加速 + XMP 段链往返。流式。
+///
+/// XMP 自检**不依赖模型**，所以没装模型也能验证图片读写链路。
+/// 这个命令还会发文档没列的两个事件：`check_xmp` / `check_gpu`。
+#[tauri::command]
+pub async fn backend_check(
+    app: AppHandle,
+    args: Option<BackendArgs>,
+) -> Result<BackendOutcome, BackendError> {
+    dispatch(app, "check", args, true).await
+}
+
+/// 删除图片 / 合集。**不可逆** —— 文件、`_tags.json` 边车、嵌在图里的 XMP
+/// 一起消失。这是唯一自洽的语义：library 是真相源，只删库行的话 `reindex`
+/// 会把它们复活。
+///
+/// `image_ids` / `coll_ids` **至少给一个**，可以混用。删合集会连**整棵子树**
+/// 一起删（子合集物理嵌在父目录里，不连带删会留下断链）。
+///
+/// 幂等：重发同一批参数得到 `missing`，不是报错 —— 中断之后重发一遍即可收尾。
+/// 建议先 `dry_run: true` 让用户确认，再真删。
+///
+/// ⚠ id 是**磁盘上的名字**（图片=文件名主干、合集=文件夹名）。
+/// 传数据库数字会得到 `missing` —— 数字换台设备就变了，不可靠。
+///
+/// 建议真删完立刻刷新当前列表：文件已经从磁盘上没了，留着只会加载失败。
+#[tauri::command]
+pub async fn backend_delete(
+    app: AppHandle,
+    args: Option<BackendArgs>,
+) -> Result<BackendOutcome, BackendError> {
+    let args = require(
+        args,
+        |a| a.image_ids.is_some() || a.coll_ids.is_some(),
+        "delete 需要 image_ids 或 coll_ids 至少一个",
+    )?;
+    // 走单飞闸门：删一半再被别的写任务插进来会收拾不干净
+    dispatch(app, "delete", Some(args), true).await
+}
+
+// ---------------------------------------------------------------------------
+// 取消
+// ---------------------------------------------------------------------------
+
+/// 取消正在跑的流式命令。没有在跑时返回 `false`（幂等）。
+///
+/// **取消就是直接 kill 进程** —— 协议层没有取消信令。后端的崩溃安全设计保证
+/// 已归档的图片安全留在 `library`，未完成的记录是 `pending`，下次启动自动收拾。
+///
+/// 前端建议：kill 之后提示「已取消，已处理的 N 张已安全入库」。
+#[tauri::command]
+pub async fn backend_cancel(state: State<'_, BackendState>) -> Result<bool, BackendError> {
+    Ok(state.cancel())
+}
