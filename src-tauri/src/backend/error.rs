@@ -43,6 +43,16 @@ pub enum BackendError {
     /// Python 侧的 `reconcile` / `journal` 设计假设单写者。
     Busy { running: String },
 
+    /// 被后来的一条请求顶掉了（限流，见 throttle.rs）。
+    ///
+    /// **这不是故障，是正常流程的一部分**：只有限流的命令（现在只有
+    /// `tag_suggest`）会产生，而且只会落在「排队期间又来了一条更新的」那种
+    /// 请求上 —— 它的结果本来就没人要了。
+    ///
+    /// 前端拿到 `kind: "superseded"` **直接忽略**，不要弹提示：输入框每敲一个
+    /// 字母都可能产生几条，弹出来就是刷屏。真正要显示的是最后那条没被顶掉的。
+    Superseded { cmd: String },
+
     /// til.toml 本身有问题
     Config { message: String },
 }
@@ -83,6 +93,13 @@ impl BackendError {
                 "kind": "busy",
                 "message": format!("已经有一个 {running} 在跑了，等它结束或者先取消。"),
                 "running": running,
+            }),
+            Self::Superseded { cmd } => json!({
+                "kind": "superseded",
+                "message": format!(
+                    "这条 {cmd} 被后到的同名请求顶掉了（限流），结果以最新那条为准。"
+                ),
+                "cmd": cmd,
             }),
             Self::Config { message } => json!({
                 "kind": "config",

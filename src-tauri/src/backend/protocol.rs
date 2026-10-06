@@ -30,7 +30,7 @@ pub struct BackendRequest<'a> {
 }
 
 /// 所有命令共用的参数表。键名必须与 `E:\Images\backend\ipc.py` 的
-/// `_COMMON_DEFAULTS` 逐字一致 —— 一共 24 个。
+/// `_COMMON_DEFAULTS` 逐字一致 —— 一共 27 个。
 ///
 /// # 为什么每个字段都必须 `skip_serializing_if`
 ///
@@ -136,6 +136,12 @@ pub struct BackendArgs {
     /// `collections`：最低出现频率（配合 `tag`）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_freq: Option<f64>,
+    /// `tag_suggest`：输入串，匹配名字**含**它的 tag。
+    ///
+    /// 空串/全空白是合法的（输入框清空是常态），后端会回空列表而不是报错。
+    /// 大小写不敏感，空格转下划线（打 `long hair` 等于 `long_hair`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
 
     // ---- delete（image_ids / coll_ids 至少给一个，可以混用）----
     /// `delete`：图片 id 数组（文件名主干）

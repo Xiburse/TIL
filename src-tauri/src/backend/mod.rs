@@ -5,13 +5,14 @@
 //! 整体结构：
 //!
 //! ```text
-//! commands.rs   9 条 Tauri command + cancel，薄封装
+//! commands.rs   13 条 Tauri command + cancel，薄封装
 //!     ↓
-//! mod.rs        BackendState：配置 + 流式单飞闸门 + run_id 分配
+//! mod.rs        BackendState：配置 + 流式单飞闸门 + 限流闸门 + run_id 分配
 //!     ↓
 //! runner.rs     起进程、双线程读、收尾、kill
 //!     ↓
 //! protocol.rs   信封与参数类型        config.rs  til.toml 的读取与查找
+//! throttle.rs   按命令限流（tag_suggest 用）—— 和上面几层无耦合，谁都能拿
 //! ```
 
 pub mod commands;
@@ -19,6 +20,9 @@ pub mod config;
 pub mod error;
 pub mod protocol;
 pub mod runner;
+pub mod throttle;
+
+use throttle::Throttle;
 
 use std::path::Path;
 use std::process::Child;
@@ -65,6 +69,13 @@ pub struct BackendState {
     streaming: Mutex<Option<Arc<RunningJob>>>,
 
     next_run_id: AtomicU64,
+
+    /// `tag_suggest` 的限流闸门（见 throttle.rs）。
+    ///
+    /// 挂在 state 上而不是做成 `static`：`static` 全进程只有一份，测试里几条
+    /// 用例会互相把对方的窗口占掉；挂在 state 上，每个 `BackendState` 一份，
+    /// 用例各造各的（生产上本来也就一个）。
+    tag_suggest: Throttle,
 }
 
 impl BackendState {
@@ -73,6 +84,7 @@ impl BackendState {
             config,
             streaming: Mutex::new(None),
             next_run_id: AtomicU64::new(1),
+            tag_suggest: Throttle::new(),
         }
     }
 
@@ -141,6 +153,11 @@ impl BackendState {
         // drive 里再拿 child 锁」，没有反向路径，不会死锁。
         runner::request_cancel(&job.child, &job.cancel);
         true
+    }
+
+    /// `tag_suggest` 的限流闸门。调用方拿它 `acquire()` 之后再决定跑不跑。
+    pub fn tag_suggest_gate(&self) -> &Throttle {
+        &self.tag_suggest
     }
 
     /// 测试用：闸门是不是被占着。

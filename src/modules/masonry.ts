@@ -11,6 +11,16 @@
  * 2. 图片陆续加载时**不会跳版**。等 onload 才排的话，先加载完的会先占位，
  *    后加载的把布局挤来挤去。
  *
+ * # 尺寸可能缺失 —— 这时按正方形算
+ *
+ * 两页的数据都会给 `width` / `height`（`inbox_scan` 连**显示尺寸**都算好了，
+ * EXIF 旋转已套用），但**都可能没有**：`inbox_scan` 里读不出文件头的图给的是
+ * `null`。这种情况下面这些函数一律按「高 = 宽」兜底，分列退化成**按张数**平摊
+ * （各列一样高、轮流落），各列真实高度会参差。
+ *
+ * 这也是刻意的：**等图片加载完再重排会让整版跟着抖**（正是上面第 2 条要避免的）。
+ * 所以尺寸的**有无**在这里是「精度」问题，不是「能不能用」问题。
+ *
  * # 高度为什么用「列宽 = 1」单位
  *
  * `heightUnits` 累计的是 `Σ (h/w)`，也就是**假设列宽为 1 时这列有多高**。
@@ -21,7 +31,27 @@
  * 而且**比大小**这件事在任何列宽下都成立（所有列等宽）。
  */
 
-import type { ImageItem } from "./types";
+// ---------------------------------------------------------------------------
+// 尺寸
+// ---------------------------------------------------------------------------
+
+/**
+ * 分列要读的那两个字段。宽或高**缺一个都行** —— 缺的按正方形算。
+ *
+ * ⚠ 这**不是**给泛型用的约束，只是 [`heightUnits`] 内部读取时的形状。两条理由：
+ *
+ * 1. 它两个字段都可选，在 TS 眼里是「弱类型（weak type）」—— 一个**没有**这两个
+ *    字段的类型拿它当约束，会直接报「has no properties in common with」；
+ * 2. 后端给的尺寸是 **`number | null`**（`inbox_scan` 读不出文件头就是 `null`），
+ *    也满足不了 `width?: number`。
+ *
+ * 所以泛型一律不加约束，尺寸在 `heightUnits` 里按 `unknown` 收、在这里收窄 ——
+ * 「有没有、坏不坏」本来就是运行时才知道的事。
+ */
+export interface Sized {
+  width?: number;
+  height?: number;
+}
 
 // ---------------------------------------------------------------------------
 // 列数
@@ -55,9 +85,9 @@ export function columnCountForWidth(width: number): number {
 // ---------------------------------------------------------------------------
 
 /** 一列的状态 */
-export interface Column {
+export interface Column<T> {
   /** 按放入顺序排列 */
-  images: ImageItem[];
+  items: T[];
   /**
    * 已占用高度，单位是「列宽 = 1」。见文件头的说明。
    *
@@ -69,39 +99,53 @@ export interface Column {
 /**
  * 一张图在「列宽 = 1」单位下的高度，也就是它的宽高比。
  *
- * 宽或高为 0 / 非有限值时按正方形兜底 —— 后端偶尔会读不到尺寸，
- * 这里兜住是为了不让 `NaN` 或 `Infinity` 渗进累加值（一旦渗进去，
- * 那一列的高度就永远是 NaN，再也不会被选中，表现为「图片全堆在其它列」）。
+ * 宽或高为 `null` / 缺失 / 0 / 非有限值时按正方形兜底 —— `inbox_scan` 读不出
+ * 文件头时给的就是 `null`。这里兜住是为了不让 `NaN` 或 `Infinity` 渗进累加值
+ * （一旦渗进去，那一列的高度就永远是 NaN，再也不会被选中，表现为「图片全堆在
+ * 其它列」）。
  */
-export function heightUnits(image: ImageItem): number {
-  const { width, height } = image;
+export function heightUnits(image: unknown): number {
+  const { width, height } = (image ?? {}) as Sized;
+  // 先判「有没有」再判「是不是好数」：`Number.isFinite` 收 `unknown`，
+  // 不会把 `number | null | undefined` 收窄成 `number`，所以这一步得分开写。
+  // `typeof null === "object"`，所以 null 在这里就被挡掉了。
+  if (typeof width !== "number" || typeof height !== "number") return 1;
   if (!Number.isFinite(width) || !Number.isFinite(height)) return 1;
   if (width <= 0 || height <= 0) return 1;
   return height / width;
 }
 
 /** 一列所有图的高度和（同样以「列宽 = 1」为单位） */
-export function columnHeightUnits(images: ImageItem[]): number {
+export function columnHeightUnits(images: unknown[]): number {
   let sum = 0;
   for (const image of images) sum += heightUnits(image);
   return sum;
 }
 
 /** 建一个空的列状态 */
-export function createColumns(count: number): Column[] {
+export function createColumns<T>(count: number): Column<T>[] {
   const safe = Math.max(1, Math.floor(count));
-  return Array.from({ length: safe }, () => ({ images: [], heightUnits: 0 }));
+  return Array.from({ length: safe }, () => ({ items: [], heightUnits: 0 }));
 }
 
 /**
- * 把一张图放进**当前最矮**的列，返回被选中的列下标。
+ * 把一条放进**当前最矮**的列，返回被选中的列下标。
  *
  * 并列最矮时取下标最小的，让结果稳定可复现 —— 否则同一批图在不同浏览器/
  * 不同运行下可能分出不同的列。
  *
  * 直接改传入的 `columns`（原地更新，不产生新数组）。
+ *
+ * @param sizeOf 从一条里取出**用哪张图来量高**。不给就量它自己。
+ *   墙上的一条可能是个**合集**（见 `wall.ts`）—— 它自己没有 `width`/`height`，
+ *   尺寸在**封面**上，所以要由调用方说清楚量的是谁。不传的话合集会被当成正方形，
+ *   整版高度全算错（分列虽然还能跑，但每列都会莫名其妙地长）。
  */
-export function placeImage(columns: Column[], image: ImageItem): number {
+export function placeImage<T>(
+  columns: Column<T>[],
+  image: T,
+  sizeOf: (item: T) => unknown = (item) => item,
+): number {
   if (columns.length === 0) {
     throw new Error("placeImage: 至少需要一列");
   }
@@ -111,12 +155,16 @@ export function placeImage(columns: Column[], image: ImageItem): number {
     if (columns[i].heightUnits < columns[best].heightUnits) best = i;
   }
 
-  columns[best].images.push(image);
-  columns[best].heightUnits += heightUnits(image);
+  columns[best].items.push(image);
+  columns[best].heightUnits += heightUnits(sizeOf(image));
   return best;
 }
 
-/** 把一批图依次放进最矮的列 */
-export function placeImages(columns: Column[], images: ImageItem[]): void {
-  for (const image of images) placeImage(columns, image);
+/** 把一批依次放进最矮的列。`sizeOf` 的含义见 [`placeImage`] */
+export function placeImages<T>(
+  columns: Column<T>[],
+  images: T[],
+  sizeOf?: (item: T) => unknown,
+): void {
+  for (const image of images) placeImage(columns, image, sizeOf);
 }

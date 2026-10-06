@@ -28,7 +28,29 @@ serde_json = "1"
 # 读 src-tauri/til.toml（全局配置）。注意 Cargo.lock 里那个 toml 是 tauri-build
 # 的 build-dependency，不算运行时依赖，必须在这里单独声明。
 toml = "1"
+# 缩略图：解码 + 缩放 + EXIF 旋转。**它的 WebP 编码器只有无损**（VP8L），
+# 有损 q80 走下面的 `webp`。关掉默认特性是为了别把 avif/exr/tiff 那一大坨
+# 编进来 —— 我们只解 jpeg/png/webp 三种。
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+# libwebp 绑定，提供有损编码。会编 C 代码（libwebp-sys 自带源码，不依赖系统库）。
+webp = "0.3"
+# 缩略图索引库。bundled = 连 SQLite 源码一起编，不依赖系统里装没装 sqlite3。
+rusqlite = { version = "0.40", features = ["bundled"] }
+# 缓存 id = sha256(原图名)。
+sha2 = "0.10"
+# 缩略图生成的并发闸门（Semaphore）。tauri 本来就依赖 tokio，这里只是显式声明。
+tokio = { version = "1", features = ["sync"] }
 
+
+# 缩略图生成在**未优化**的 dev 构建下慢到不能用：实测同一张 3000×6088 的图，
+# release 500ms、dev 14s（差 30 倍）。热路径全在依赖里（libwebp 的 C 代码、
+# image crate 的缩放），而 Cargo 默认对依赖也不开优化 —— 于是 `pnpm tauri dev`
+# 下点开一面墙要等十几秒一张，看着像卡死。
+#
+# 这条只把**依赖**按 release 优化，本 crate 自己仍不优化、照样能断点调试。
+# 代价是依赖要重编一次（一次性），换来 dev 下的缩略图快 30 倍。
+[profile.dev.package."*"]
+opt-level = 3
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

@@ -96,6 +96,17 @@ export interface BackendArgs {
   /** `collections`：最低出现频率（配合 `tag`） */
   min_freq?: number;
 
+  // tag_suggest（输入框候选）
+  /**
+   * `tag_suggest`：输入串，匹配名字**含**它的 tag。**必传**（空串是合法的，
+   * 输入框清空是常态）。
+   *
+   * 大小写不敏感，空格转下划线（打 `long hair` 等于 `long_hair`）。
+   * 不传的话 Python 侧按 `null` 处理、静默回空列表，和「这个词没有候选」
+   * 长得一模一样 —— 前端会以为是自己查错了。
+   */
+  query?: string;
+
   // delete（和 image_ids / coll_ids 至少给一个）
   /** `delete`：图片 id 数组（文件名主干） */
   image_ids?: string[];
@@ -133,7 +144,15 @@ export interface BackendOutcome {
 
 /** Rust 侧 `BackendError` 序列化后的扁平对象（传输层失败） */
 export interface BackendTransportErrorPayload {
-  kind: "spawn" | "no_result" | "protocol" | "cancelled" | "busy" | "config";
+  kind:
+    | "spawn"
+    | "no_result"
+    | "protocol"
+    | "cancelled"
+    | "busy"
+    | "config"
+    /** 被后来的同名请求顶掉了（限流）。**不是故障**，见 `tagSuggest` 的说明 */
+    | "superseded";
   message: string;
   exit_code?: number;
   stderr?: string;
@@ -171,6 +190,17 @@ export class BackendCallError extends Error {
     this.code = init.code;
     this.stderr = init.stderr;
     this.exitCode = init.exitCode;
+  }
+
+  /**
+   * 被限流顶掉了（见 Rust 侧 `throttle.rs`）。
+   *
+   * **这不是失败**：只有限流的命令（现在只有 `tag_suggest`）会产生，而且只会
+   * 落在「排队期间又来了一条更新的」那种请求上 —— 它的结果本来就没人要了。
+   * 调用方**直接忽略**，既不弹提示也不走错误分支。
+   */
+  get superseded(): boolean {
+    return this.kind === "superseded";
   }
 }
 
@@ -320,6 +350,41 @@ export function getCollections(args?: BackendArgs): Promise<CollectionsData> {
   return call<CollectionsData>("backend_collections", args);
 }
 
+/** `tag_suggest` 返回里的一条候选 */
+export interface TagSuggestion {
+  /** tag 的**下划线原形**（`long_hair`），不是显示用的空格形式 */
+  tag: string;
+  /** 0 = 普通，4 = 角色，9 = 分级 */
+  category: number;
+  /** 有多少张图带这个 tag。口径受 `min_conf` 支配，默认含没过阈值的 */
+  count: number;
+}
+
+export interface TagSuggestData {
+  /** 回显这次的输入串 */
+  query: string;
+  /** 命中总数（**`limit` 截断之前**），可用来显示「还有更多」 */
+  total: number;
+  /** **已按图数从多到少排好，同数的按字母序 —— 顺序直接就是显示顺序** */
+  tags: TagSuggestion[];
+}
+
+/**
+ * 按字母补全 tag，各带图数。给输入框做候选用。
+ *
+ * 匹配是「**包含**」不是前缀，大小写不敏感，空格转下划线。`limit` 默认 50。
+ * 源是 CSV 词表而不是数据库，所以会回出**库里一张图都没有的 tag**（`count: 0`，
+ * 排在最后、默认被 `limit` 截掉）。
+ *
+ * ⚠ **别做前端防抖。** 每敲一个字母发一次是设计好的：Rust 侧有一道 200ms 的
+ * 限流闸门，窗口内挤进来的请求只留最新那条，其余的直接以 `kind: "superseded"`
+ * 抛出来（用 `e.superseded` 判）。**拿到它直接忽略** —— 输入框里每敲一下都可能
+ * 产生几条，弹提示就是刷屏；真正要显示的是最后那条没被顶掉的。
+ */
+export function tagSuggest(args: BackendArgs): Promise<TagSuggestData> {
+  return call<TagSuggestData>("backend_tag_suggest", args);
+}
+
 export interface CollectionTagStat {
   tag: string;
   category: number;
@@ -339,6 +404,99 @@ export interface CollectionTagsData {
 /** 同名合集可能有多个（每次投放算一个新合集），**全部返回** */
 export function getCollectionTags(args: BackendArgs): Promise<CollectionTagsData> {
   return call<CollectionTagsData>("backend_collection_tags", args);
+}
+
+// ---------------------------------------------------------------------------
+// 待入库（inbox）
+// ---------------------------------------------------------------------------
+
+/**
+ * `inbox/` 里的一张图。**没有 `image_id`** —— 它还没入库，那是入库后才有的名字，
+ * 所以定位它只能靠 `rel_path`（顶层散图另有 `kind: "image"`，这里不依赖它）。
+ */
+export interface InboxImage {
+  /** 文件名（含扩展名） */
+  name: string;
+  /** 相对项目根的路径 */
+  rel_path: string;
+  /** 绝对路径。给 `<img>` 用之前要先过 convertFileSrc，见 InboxCard.vue */
+  abs_path: string;
+  /**
+   * **显示**尺寸 —— EXIF 旋转已套用，和入库后 `images.width` / `height` 同一个
+   * 口径（竖拍图不会差一次宽高对调）。
+   *
+   * `null` = **连文件头都读不了**（签名不对 / chunk 结构坏了 / 根本不是图片），
+   * 这种必然入库失败。
+   *
+   * ⚠ **反过来不成立**：读文件头不解码像素，所以**像素数据被截断的图照样报得出
+   * 尺寸** —— 实测一张截半的 PNG 这里仍回 `1458x2500`，而 `ingest` 解码时会失败。
+   * 尺寸能用来**排版和显示**，不能当「必能入库」的保证。
+   *
+   * ⚠ EXIF 朝向**只对 JPEG 读**，带旋转元数据的 PNG 这里报的是原始尺寸。
+   */
+  width: number | null;
+  height: number | null;
+  /** 文件字节数。`null` 的语义同 `width` / `height` */
+  size_bytes: number | null;
+}
+
+/**
+ * `inbox/` 里的一个合集 —— 子合集**递归嵌套**在 `children` 里。
+ *
+ * 两个「图片数」别搞混：`image_count` 是**本层直接**的图片数，`image_total` 含
+ * 全部后代。父层加子层会**重复计**，要「总共有多少」只看顶层的 `total_images`。
+ */
+export interface InboxCollection {
+  kind: "collection";
+  name: string;
+  rel_path: string;
+  abs_path: string;
+  /** 0 = 根合集 */
+  depth: number;
+  /** 同级序号，父下的第 N 个 */
+  side: number;
+  /** **本层直接**图片数 */
+  image_count: number;
+  /** **整棵子树**的图片数（含全部后代） */
+  image_total: number;
+  images: InboxImage[];
+  /** 不是图片、入库时会被跳过的文件 */
+  skipped_files: string[];
+  /** 超过 max_coll_depth 而被忽略的子目录 */
+  skipped_dirs: string[];
+  children: InboxCollection[];
+}
+
+/** 顶层条目：散图或合集 */
+export type InboxEntry = (InboxImage & { kind: "image" }) | InboxCollection;
+
+export interface InboxScanData {
+  /** **整棵树的图片总数** —— 「待入库多少张图」看它，不是 `status.inbox_pending` */
+  total_images: number;
+  /** 顶层散图数 */
+  loose_count: number;
+  /** 顶层合集数 */
+  collection_count: number;
+  /** 顶层条目，**已按名字排好**（和文件夹里看到的一致）。顺序就是显示顺序 */
+  items: InboxEntry[];
+}
+
+/**
+ * 待入库清单：`inbox/` 里有哪些散图、哪些合集（合集递归嵌套）。
+ *
+ * 给前端展示用 —— 用户先看清楚有什么，再决定怎么入库。**不带参数**。
+ *
+ * ⚠ 它**不加载模型、不碰数据库**，但每张图要开一次文件头读尺寸，所以比纯目录
+ * 扫描贵一点（实测约 0.19s，19 张）。可以在用户拖完文件夹后立刻调。
+ * 也是**只读**的：调多少次都不会改变 inbox。
+ *
+ * ⚠ **进不进列表只看扩展名** —— 像素数据被截断的 `.jpg` 也会出现在这里（而且
+ * 尺寸照样报得出来，见 `InboxImage`），能不能真入库要等 `ingest` 才知道。
+ * 别拿这个列表当「必能成功」的保证。
+ */
+export function inboxScan(): Promise<InboxScanData> {
+  // 不带参数：让 Rust 侧的 `Option<BackendArgs>` 落到 None，请求里连 args 键都没有
+  return call<InboxScanData>("backend_inbox_scan");
 }
 
 // ---- 流式命令 ----

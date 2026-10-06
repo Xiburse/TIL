@@ -1,4 +1,4 @@
-//! 9 条后端命令的 Tauri 封装，外加取消。
+//! 13 条后端命令的 Tauri 封装，外加取消。
 //!
 //! # 为什么是 9 个命令而不是一个 `backend_invoke(cmd, args)`
 //!
@@ -23,6 +23,7 @@
 
 use tauri::{AppHandle, Manager, State};
 
+use super::throttle::Turn;
 use super::{BackendArgs, BackendError, BackendOutcome, BackendState};
 
 /// 把活儿丢进 blocking 线程池再 await。
@@ -39,6 +40,34 @@ async fn dispatch(
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<BackendState>();
         state.execute(Some(&app), cmd, args, streaming)
+    })
+    .await
+    .map_err(|e| BackendError::Spawn {
+        message: format!("后台任务异常终止：{e}"),
+    })?
+}
+
+/// 过限流闸门的 `dispatch`。见 [`backend_tag_suggest`]。
+///
+/// 和 [`dispatch`] 的唯一区别是**跑之前先排队**：闸门每 `WINDOW` 只放行一次，
+/// 窗口内挤进来的请求只留最新那条，其余在这里直接翻成
+/// [`BackendError::Superseded`] 返回，**不会起 Python 进程**。
+///
+/// ⚠ 排队是阻塞的（最多 `WINDOW`），所以整段都包在 `spawn_blocking` 里 ——
+/// 直接在 command 的 fn 体里排队会占死 tokio worker。
+async fn dispatch_gated(
+    app: AppHandle,
+    cmd: &'static str,
+    args: Option<BackendArgs>,
+) -> Result<BackendOutcome, BackendError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<BackendState>();
+        match state.tag_suggest_gate().acquire() {
+            Turn::Superseded => Err(BackendError::Superseded {
+                cmd: cmd.to_string(),
+            }),
+            Turn::Go => state.execute(Some(&app), cmd, args, false),
+        }
     })
     .await
     .map_err(|e| BackendError::Spawn {
@@ -131,6 +160,44 @@ pub async fn backend_collections(
     dispatch(app, "collections", args, false).await
 }
 
+/// 按 tag 子串查候选**集合**，每条带「多少张图有它」。
+///
+/// 给查询框做补全用：`query` 是子串（**包含**匹配，不是前缀），大小写不敏感，
+/// 空格转下划线。`limit` 默认 50（按图数从多到少，同数的按字母序）。
+///
+/// `min_conf` 是**图数口径**：默认 0 = 「进库就算」，含当初没过阈值的 tag；
+/// 要「真正命中」的图数就传 0.35（config.toml 里的 general 阈值）。同一个 tag
+/// 两个口径能差出好几张，别混。
+///
+/// 源是 CSV 词表而不是数据库，所以会回出**库里一张图都没有的 tag**
+/// （`count: 0`，排在最后、默认被 `limit` 截掉）。
+/// 返回里还有 `total`（截断前的命中总数），可用来显示「还有更多」。
+///
+/// # 限流：这条是唯一一条会被「顶掉」的命令
+///
+/// 输入框每敲一个字母前端就会调一次，而**每次调用都是一次 Python 冷启动**
+/// （150–300ms）—— 敲四个字母就排四个进程，回来的顺序还不保证。所以这条走
+/// [`dispatch_gated`]：**每 200ms 最多真跑一次**，窗口内挤进来的请求只留最新的
+/// 那条，其余的直接返回 `kind: "superseded"`（见 throttle.rs）。
+///
+/// 前端拿到 `superseded` **直接忽略**，别弹提示、也别当成失败 —— 输入框里每敲
+/// 一下都可能产生几条，真正要显示的是最后那条没被顶掉的。
+///
+/// ⚠ `query` **必传**（可以是空串）。不传的话 Python 那边按 `null` 处理、静默
+/// 回空列表，和「这个词没有候选」长得一模一样 —— 前端会以为是自己查错了。
+#[tauri::command]
+pub async fn backend_tag_suggest(
+    app: AppHandle,
+    args: Option<BackendArgs>,
+) -> Result<BackendOutcome, BackendError> {
+    let args = require(
+        args,
+        |a| a.query.is_some(),
+        "tag_suggest 需要 query（空串是合法的：输入框清空是常态）",
+    )?;
+    dispatch_gated(app, "tag_suggest", Some(args)).await
+}
+
 /// 某个合集的 tag 频次表。
 ///
 /// 同名合集可能有多个（每次投放算一个新合集），**全部返回**。
@@ -147,6 +214,27 @@ pub async fn backend_collection_tags(
         "collection_tags 需要 name 或 coll_id（合集文件夹名，不是数据库 id）",
     )?;
     dispatch(app, "collection_tags", Some(args), false).await
+}
+
+/// 待入库清单：`inbox/` 里有哪些散图、哪些合集（合集**递归嵌套**）。
+///
+/// **不带参数**，也不加载模型、不碰数据库。每张图会开一次文件头读尺寸，所以比
+/// 纯目录扫描贵一点（实测约 0.19s，19 张），可以放心在用户拖完文件夹后立刻调。
+///
+/// 几个容易用错的地方（详见 `E:\Images\API.md` 的 `inbox_scan` 一节）：
+///
+/// - **`total_images` 才是「待入库多少张图」**。`status.inbox_pending` 数的是
+///   **顶层条目**（一个含 4 张图的合集算 1），两者对不上是正常的。
+/// - `image_count`（本层直接图片数）≠ `image_total`（整棵子树），父层加子层会
+///   **重复计**。
+/// - 每条图片记录都带 `width` / `height` / `size_bytes`（**可能是 `null`** ——
+///   连文件头都读不了，那种必然入库失败）。尺寸是**显示尺寸**，EXIF 旋转已套用。
+///   但**像素数据被截断的图照样报得出尺寸**，所以它只能用来排版，不能当
+///   「必能入库」的保证。
+/// - 进不进列表只看扩展名，不做内容校验。
+#[tauri::command]
+pub async fn backend_inbox_scan(app: AppHandle) -> Result<BackendOutcome, BackendError> {
+    dispatch(app, "inbox_scan", None, false).await
 }
 
 // ---------------------------------------------------------------------------
